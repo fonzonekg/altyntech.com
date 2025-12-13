@@ -1,0 +1,1549 @@
+import telebot
+from telebot import types
+import json
+import hashlib
+import requests
+from datetime import datetime, timedelta
+import time
+import threading
+import re
+import os
+import logging
+import traceback
+from collections import OrderedDict
+import sys
+
+# ===== НАСТРОЙКИ ЛОГИРОВАНИЯ =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ===== КОНСТАНТЫ =====
+PREMIUM_PRICE = 299  # сом
+PREMIUM_DURATION_DAYS = 30
+PAYMENT_CHECK_INTERVAL = 30  # секунд
+
+# ===== АДМИНИСТРАТОРЫ =====
+# ID администраторов (можно задать через переменные окружения)
+ADMIN_CEO_ID = os.getenv("7577716374", "7577716374")  # ID или username CEO
+ADMIN_SUPPORT_ID = os.getenv("6764228404", "6764228404")  # ID или username Поддержки
+
+# Функция для проверки администратора
+def is_admin(user_id, username=None):
+    """Проверяет, является ли пользователь администратором"""
+    user_id_str = str(user_id)
+    if username:
+        # Проверка по username
+        if username in [ADMIN_CEO_ID, ADMIN_SUPPORT_ID]:
+            return True
+    
+    # Проверка по ID
+    return user_id_str in [ADMIN_CEO_ID, ADMIN_SUPPORT_ID]
+
+# ===== СТРУКТУРЫ ДАННЫХ =====
+class DataStorage:
+    """Управление всеми данными бота"""
+    def __init__(self):
+        self.users = OrderedDict()  # user_id -> user_data
+        self.states = OrderedDict() # user_id -> state_data
+        self.invoices = OrderedDict() # invoice_id -> invoice_data
+        self.premium_users = set()  # user_id
+        self.support_messages = OrderedDict() # user_id -> support_message_data
+        self.contacts = OrderedDict() # user_id -> contact_info
+        self.message_cache = OrderedDict() # (user_id, message_id) -> message_data
+        self.user_invoices = OrderedDict() # user_id -> [invoice_ids] для быстрого поиска
+        self.admin_reply_context = OrderedDict() # admin_id -> reply_context
+        self.admin_messages = OrderedDict() # (admin_id, message_id) -> user_id (для отслеживания сообщений админам)
+        
+    def cleanup_old_data(self, max_age_hours=24):
+        """Очистка старых данных"""
+        cutoff = datetime.now() - timedelta(hours=max_age_hours)
+        keys_to_remove = []
+        
+        for user_id, state in list(self.states.items()):
+            if state.get('last_activity', datetime.min) < cutoff:
+                keys_to_remove.append(('states', user_id))
+        
+        # Ограничиваем размер кэша сообщений
+        if len(self.message_cache) > 1000:
+            excess = len(self.message_cache) - 800
+            for _ in range(excess):
+                if self.message_cache:
+                    self.message_cache.popitem(last=False)
+
+storage = DataStorage()
+
+# ===== УМНАЯ СИСТЕМА ПОДДЕРЖКИ =====
+class SmartSupportSystem:
+    """Интеллектуальная система поддержки с предотвращением дубликатов и автоопределением категорий"""
+    
+    def __init__(self):
+        self.tickets = OrderedDict()  # ticket_id -> ticket_data
+        self.user_last_tickets = OrderedDict()  # user_id -> [ticket_ids]
+        self.categories = {
+            'payment': ['оплат', 'деньг', 'средств', 'платёж', 'платеж', 'донат', 'premium', 'премиум'],
+            'technical': ['ошибк', 'баг', 'глюк', 'не работ', 'сбой', 'техническ', 'видео', 'файл'],
+            'suggestion': ['предложен', 'идея', 'улучшен', 'функц', 'хочу', 'можно', 'добав'],
+            'general': ['как', 'что', 'вопрос', 'интерес', 'помощь', 'подскаж']
+        }
+        self.ticket_counter = 0
+        
+    def _generate_ticket_id(self):
+        """Генерация уникального ID тикета"""
+        self.ticket_counter += 1
+        return f"TKT{self.ticket_counter:06d}"
+    
+    def _categorize_text(self, text):
+        """Автоматическое определение категории обращения"""
+        text_lower = text.lower()
+        for category, keywords in self.categories.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return category
+        return 'other'
+    
+    def _find_duplicate_tickets(self, user_id, text):
+        """Поиск дублирующих тикетов"""
+        duplicates = []
+        if user_id in self.user_last_tickets:
+            for ticket_id in self.user_last_tickets[user_id][-5:]:  # Проверяем последние 5 тикетов
+                ticket = self.tickets.get(ticket_id)
+                if ticket and ticket['status'] in ['new', 'pending']:
+                    # Простая проверка схожести по ключевым словам
+                    ticket_text = ticket['messages'][0]['text'].lower()
+                    new_text = text.lower()
+                    
+                    # Находим общие значимые слова
+                    ticket_words = set(re.findall(r'\b\w{4,}\b', ticket_text))
+                    new_words = set(re.findall(r'\b\w{4,}\b', new_text))
+                    common_words = ticket_words.intersection(new_words)
+                    
+                    if len(common_words) >= 3:  # Если есть 3+ общих слова
+                        duplicates.append(ticket)
+        
+        return duplicates
+    
+    def create_ticket(self, user_id, username, first_name, last_name, text):
+        """Создание нового тикета с проверкой на дубликаты"""
+        
+        # Поиск дубликатов
+        duplicates = self._find_duplicate_tickets(user_id, text)
+        
+        # Определение категории
+        category = self._categorize_text(text)
+        
+        # Генерация ID тикета
+        ticket_id = self._generate_ticket_id()
+        
+        # Создание тикета
+        ticket = {
+            'ticket_id': ticket_id,
+            'user_id': user_id,
+            'username': username or 'не указан',
+            'first_name': first_name,
+            'last_name': last_name,
+            'category': category,
+            'status': 'new',
+            'created_at': datetime.now(),
+            'updated_at': datetime.now(),
+            'messages': [
+                {
+                    'text': text,
+                    'sender': 'user',
+                    'timestamp': datetime.now()
+                }
+            ],
+            'logs': [
+                {
+                    'action': 'created',
+                    'timestamp': datetime.now(),
+                    'details': f'Тикет создан. Категория: {category}'
+                }
+            ],
+            'duplicate_of': duplicates[0]['ticket_id'] if duplicates else None
+        }
+        
+        # Сохранение тикета
+        self.tickets[ticket_id] = ticket
+        
+        # Обновление истории пользователя
+        if user_id not in self.user_last_tickets:
+            self.user_last_tickets[user_id] = []
+        self.user_last_tickets[user_id].append(ticket_id)
+        
+        # Логирование
+        logger.info(f"Создан тикет {ticket_id} для пользователя {user_id}. Категория: {category}")
+        
+        return ticket, duplicates
+    
+    def add_message(self, ticket_id, sender, text, action=None):
+        """Добавление сообщения в тикет"""
+        if ticket_id not in self.tickets:
+            return False
+        
+        ticket = self.tickets[ticket_id]
+        ticket['messages'].append({
+            'text': text,
+            'sender': sender,
+            'timestamp': datetime.now()
+        })
+        
+        if action:
+            ticket['logs'].append({
+                'action': action,
+                'timestamp': datetime.now(),
+                'details': text[:100]  # Первые 100 символов для логирования
+            })
+        
+        ticket['updated_at'] = datetime.now()
+        
+        logger.info(f"Добавлено сообщение в тикет {ticket_id} от {sender}")
+        return True
+    
+    def update_status(self, ticket_id, status, admin_id=None):
+        """Обновление статуса тикета"""
+        if ticket_id not in self.tickets:
+            return False
+        
+        ticket = self.tickets[ticket_id]
+        old_status = ticket['status']
+        ticket['status'] = status
+        ticket['updated_at'] = datetime.now()
+        
+        # Логирование изменения статуса
+        action = f"status_changed_{status}"
+        details = f"Статус изменен с {old_status} на {status}"
+        if admin_id:
+            details += f" администратором {admin_id}"
+        
+        ticket['logs'].append({
+            'action': action,
+            'timestamp': datetime.now(),
+            'details': details
+        })
+        
+        logger.info(f"Статус тикета {ticket_id} изменен: {old_status} -> {status}")
+        return True
+    
+    def get_ticket(self, ticket_id):
+        """Получение информации о тикете"""
+        return self.tickets.get(ticket_id)
+    
+    def get_user_tickets(self, user_id, limit=10):
+        """Получение тикетов пользователя"""
+        if user_id not in self.user_last_tickets:
+            return []
+        
+        user_tickets = []
+        for ticket_id in reversed(self.user_last_tickets[user_id][-limit:]):
+            ticket = self.tickets.get(ticket_id)
+            if ticket:
+                user_tickets.append(ticket)
+        
+        return user_tickets
+
+# Инициализация умной системы поддержки
+smart_support = SmartSupportSystem()
+
+# ===== КЛАВИАТУРЫ =====
+def get_main_keyboard():
+    """Основная клавиатура, которая ВСЕГДА отображается"""
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2,
+        one_time_keyboard=False  # Важно: не скрывать после нажатия!
+    )
+    keyboard.add(
+        types.KeyboardButton("📖 FAQ"),
+        types.KeyboardButton("💎 Донат")
+    )
+    keyboard.add(types.KeyboardButton("📞 Поддержка"))
+    return keyboard
+
+def get_cancel_keyboard():
+    """Клавиатура с кнопкой отмены"""
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+    keyboard.add(types.KeyboardButton("❌ Отмена"))
+    return keyboard
+
+def get_admin_keyboard(ticket_id, user_id):
+    """Inline-клавиатура для администратора с тикетом"""
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    keyboard.add(
+        types.InlineKeyboardButton("📝 Ответить", callback_data=f"admin_reply:{user_id}:{ticket_id}"),
+        types.InlineKeyboardButton("✅ Решено", callback_data=f"admin_solved:{user_id}:{ticket_id}"),
+        types.InlineKeyboardButton("⏳ В работе", callback_data=f"admin_pending:{user_id}:{ticket_id}")
+    )
+    keyboard.row(types.InlineKeyboardButton("📊 История тикетов", callback_data=f"admin_history:{user_id}"))
+    return keyboard
+
+# ===== ИНИЦИАЛИЗАЦИЯ БОТА =====
+try:
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8397567369:AAFki44pWtxP5M9iPGEn26yvUsu1Fv-9g3o")
+    CRYPTO_BOT_API_KEY = os.getenv("CRYPTO_BOT_API_KEY", "498509:AABNPgPwTiCU9DdByIgswTvIuSz5VO9neRy")
+    CHANNEL_ID = os.getenv("CHANNEL_ID", "@FonZoneKg")
+    SUPPORT_CHAT_ID = os.getenv("SUPPORT_CHAT_ID", "@FONZONE_CL")
+    
+    bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+    
+    # Конфигурация CryptoBot
+    CRYPTO_BOT_API_URL = "https://pay.crypt.bot/api/"
+    CRYPTO_BOT_HEADERS = {
+        "Crypto-Pay-API-Token": CRYPTO_BOT_API_KEY,
+        "Content-Type": "application/json"
+    }
+    
+except Exception as e:
+    logger.error(f"Ошибка инициализации бота: {e}")
+    raise
+
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+def safe_send_message(user_id, text, **kwargs):
+    """Безопасная отправка сообщения с обработкой ошибок"""
+    try:
+        # Гарантируем наличие основной клавиатуры, если не указано иное
+        if 'reply_markup' not in kwargs:
+            kwargs['reply_markup'] = get_main_keyboard()
+        
+        # Ограничиваем длину текста для Telegram
+        if len(text) > 4096:
+            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+            messages = []
+            for part in parts:
+                msg = bot.send_message(user_id, part, **kwargs)
+                messages.append(msg)
+            return messages
+        else:
+            return bot.send_message(user_id, text, **kwargs)
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        return None
+
+def safe_send_video(user_id, video_path, caption, **kwargs):
+    """Безопасная отправка видео"""
+    try:
+        with open(video_path, 'rb') as video:
+            return bot.send_video(user_id, video, caption=caption, **kwargs)
+    except Exception as e:
+        logger.error(f"Ошибка отправки видео пользователю {user_id}: {e}")
+        # При ошибке отправляем текстовое сообщение
+        return safe_send_message(user_id, caption, **kwargs)
+
+def reset_user_state(user_id):
+    """Сброс состояния пользователя"""
+    if user_id in storage.states:
+        del storage.states[user_id]
+        ensure_main_keyboard(user_id)
+        return True
+    return False
+
+def ensure_main_keyboard(user_id):
+    """Гарантированное отображение основной клавиатуры"""
+    try:
+        bot.send_chat_action(user_id, 'typing')
+        msg = safe_send_message(user_id, " ", reply_markup=get_main_keyboard())
+        
+        if msg:
+            if isinstance(msg, list):
+                for m in msg:
+                    storage.message_cache[(user_id, m.message_id)] = {
+                        'type': 'keyboard_refresh',
+                        'timestamp': datetime.now()
+                    }
+            else:
+                storage.message_cache[(user_id, msg.message_id)] = {
+                    'type': 'keyboard_refresh',
+                    'timestamp': datetime.now()
+                }
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка отправки основной клавиатуры: {e}")
+        return False
+
+# ===== СИСТЕМА СОСТОЯНИЙ =====
+class UserState:
+    """Управление состоянием пользователя"""
+    
+    @staticmethod
+    def set_state(user_id, state_name, data=None):
+        """Установка состояния пользователя"""
+        storage.states[user_id] = {
+            'state': state_name,
+            'data': data or {},
+            'timestamp': datetime.now()
+        }
+        logger.info(f"Установлено состояние {state_name} для пользователя {user_id}")
+    
+    @staticmethod
+    def get_state(user_id):
+        """Получение состояния пользователя"""
+        return storage.states.get(user_id, {}).get('state')
+    
+    @staticmethod
+    def get_data(user_id, key=None):
+        """Получение данных состояния"""
+        state = storage.states.get(user_id, {})
+        if key:
+            return state.get('data', {}).get(key)
+        return state.get('data', {})
+
+# ===== CRYPTOBOT API =====
+class CryptoBotAPI:
+    """Интерфейс для работы с CryptoBot API"""
+    
+    @staticmethod
+    def create_invoice(amount, currency="USDT", description="", payload=""):
+        """Создание инвойса"""
+        try:
+            url = CRYPTO_BOT_API_URL + "createInvoice"
+            data = {
+                "asset": currency,
+                "amount": str(amount),
+                "description": description,
+                "hidden_message": "Оплата через CryptoBot",
+                "paid_btn_name": "viewItem",
+                "paid_btn_url": "https://t.me/yourbot",
+                "payload": payload
+            }
+            
+            response = requests.post(url, headers=CRYPTO_BOT_HEADERS, json=data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get("ok"):
+                invoice = result["result"]
+                invoice_id = invoice["invoice_id"]
+                
+                # Сохраняем инвойс
+                storage.invoices[invoice_id] = {
+                    "user_id": payload,
+                    "amount": amount,
+                    "currency": currency,
+                    "status": "active",
+                    "created_at": datetime.now(),
+                    "pay_url": invoice["pay_url"],
+                    "invoice_data": invoice
+                }
+                
+                # Сохраняем ссылку в user_invoices для быстрого поиска
+                if payload not in storage.user_invoices:
+                    storage.user_invoices[payload] = []
+                storage.user_invoices[payload].append(invoice_id)
+                
+                logger.info(f"Создан инвойс {invoice_id} для пользователя {payload}")
+                return invoice
+            else:
+                logger.error(f"CryptoBot API ошибка: {result}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка сети CryptoBot: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка создания инвойса: {e}")
+            return None
+    
+    @staticmethod
+    def get_invoice_status(invoice_id):
+        """Получение статуса инвойса"""
+        try:
+            url = CRYPTO_BOT_API_URL + "getInvoices"
+            data = {"invoice_ids": [invoice_id]}
+            
+            response = requests.post(url, headers=CRYPTO_BOT_HEADERS, json=data, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            if result.get("ok") and result["result"]["items"]:
+                return result["result"]["items"][0].get("status", "active")
+                
+        except Exception as e:
+            logger.error(f"Ошибка проверки статуса инвойса: {e}")
+        
+        return None
+
+# ===== ПРОВЕРКА ПЛАТЕЖЕЙ В ФОНОВОМ РЕЖИМЕ =====
+def payment_checker_loop():
+    """Фоновая проверка статуса платежей"""
+    logger.info("Запущен фоновый процесс проверки платежей")
+    
+    while True:
+        try:
+            current_time = datetime.now()
+            
+            # Проверяем каждый инвойс
+            for invoice_id, invoice_data in list(storage.invoices.items()):
+                try:
+                    # Пропускаем старые инвойсы (старше 24 часов)
+                    if (current_time - invoice_data.get("created_at", current_time)).total_seconds() > 86400:
+                        continue
+                    
+                    # Проверяем только активные инвойсы
+                    if invoice_data.get("status") == "active":
+                        status = CryptoBotAPI.get_invoice_status(invoice_id)
+                        
+                        if status:
+                            invoice_data["status"] = status
+                            
+                            # Обработка оплаченного инвойса
+                            if status == "paid":
+                                user_id = invoice_data.get("user_id")
+                                amount = invoice_data.get("amount", 0)
+                                
+                                if user_id:
+                                    # Для инвойсов с суммой 3 USDT и более активируем премиум
+                                    if amount >= 3:
+                                        storage.premium_users.add(user_id)
+                                        
+                                        # Обновляем данные пользователя
+                                        if user_id in storage.users:
+                                            storage.users[user_id]["is_premium"] = True
+                                            storage.users[user_id]["premium_until"] = (
+                                                datetime.now() + timedelta(days=PREMIUM_DURATION_DAYS)
+                                            ).isoformat()
+                                        
+                                        # Уведомляем пользователя
+                                        try:
+                                            bot.send_message(
+                                                user_id,
+                                                "🎉 <b>Поздравляем!</b>\n\n"
+                                                "Ваш PREMIUM статус успешно активирован!",
+                                                reply_markup=get_main_keyboard()
+                                            )
+                                            logger.info(f"Активирован PREMIUM для пользователя {user_id}")
+                                        except Exception as e:
+                                            logger.error(f"Ошибка уведомления о премиуме: {e}")
+                                    else:
+                                        # Простая поддержка - просто благодарим
+                                        try:
+                                            bot.send_message(
+                                                user_id,
+                                                "❤️ <b>Спасибо за поддержку!</b>\n\n"
+                                                "Ваш донат помогает развивать бота.",
+                                                reply_markup=get_main_keyboard()
+                                            )
+                                            logger.info(f"Поддержка от пользователя {user_id}: {amount} {invoice_data.get('currency')}")
+                                        except Exception as e:
+                                            logger.error(f"Ошибка благодарности за донат: {e}")
+                                    
+                                    # Обновляем статус инвойса
+                                    invoice_data["paid_at"] = datetime.now()
+                
+                except Exception as e:
+                    logger.error(f"Ошибка проверки инвойса {invoice_id}: {e}")
+            
+            # Пауза между проверками
+            time.sleep(PAYMENT_CHECK_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"Критическая ошибка в проверке платежей: {e}")
+            time.sleep(60)
+
+# Запускаем фоновую проверку
+payment_thread = threading.Thread(target=payment_checker_loop, daemon=True)
+payment_thread.start()
+
+# ===== ОСНОВНЫЕ КОМАНДЫ =====
+@bot.message_handler(commands=['start'])
+def start_command(message):
+    """Обработка команды /start с видео"""
+    user_id = message.from_user.id
+    user_name = message.from_user.username or message.from_user.first_name
+    
+    # Регистрируем/обновляем пользователя
+    if user_id not in storage.users:
+        storage.users[user_id] = {
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name,
+            "last_name": message.from_user.last_name,
+            "created_at": datetime.now().isoformat(),
+            "is_premium": user_id in storage.premium_users,
+            "premium_until": None
+        }
+        logger.info(f"Новый пользователь: {user_id} ({user_name})")
+    
+    # Сбрасываем состояние пользователя
+    reset_user_state(user_id)
+    
+    # НОВЫЙ ТЕКСТ ПРИВЕТСТВИЯ согласно ТЗ
+    welcome_text = """<b>Добро пожаловать в FonZone 📱</b>
+Платформа, созданная для комфортного размещения объявлений о смартфонах.
+
+✅ Быстрое добавление  
+✅ Понятный интерфейс  
+✅ Удобный формат
+
+Всё, чтобы подать объявление без лишних сложностей!"""
+    
+    # Отправляем видео с приветственным текстом или просто текст
+    try:
+        # Пытаемся отправить видео (предполагается, что файл welcome.mp4 существует в текущей директории)
+        video_path = "welcome.mp4"
+        if os.path.exists(video_path):
+            # Отправляем видео с заголовком
+            with open(video_path, 'rb') as video:
+                bot.send_video(
+                    user_id, 
+                    video, 
+                    caption=welcome_text, 
+                    parse_mode="HTML",
+                    reply_markup=get_main_keyboard()
+                )
+            logger.info(f"Отправлено видео приветствия пользователю {user_id}")
+        else:
+            # Если видео не найдено, отправляем только текст
+            bot.send_message(
+                user_id, 
+                welcome_text, 
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard()
+            )
+            logger.warning(f"Видеофайл {video_path} не найден, отправлен текст")
+    except Exception as e:
+        logger.error(f"Ошибка отправки приветствия: {e}")
+        # При ошибке отправляем текстовое сообщение
+        bot.send_message(
+            user_id, 
+            welcome_text, 
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard()
+        )
+
+@bot.message_handler(func=lambda m: m.text == "📖 FAQ")
+def faq_command(message):
+    """Показать FAQ"""
+    user_id = message.from_user.id
+    
+    faq_text = """
+📖 <b>FAQ / Часто задаваемые вопросы</b>
+
+❓ <b>Сколько стоит PREMIUM статус?</b>
+• Премиум статус: <b>299 сом/месяц</b> (примерно 3 USDT)
+
+❓ <b>Что дает PREMIUM статус?</b>
+✅ Приоритетная поддержка
+
+❓ <b>Как оплатить?</b>
+• Используйте кнопку "💎 Донат"
+• Выберите сумму оплаты
+• Оплатите через CryptoBot
+
+❓ <b>Как связаться с поддержкой?</b>
+• Нажмите кнопку "📞 Поддержка"
+• Опишите вашу проблему
+• Менеджер ответит в течение 24 часов
+
+⚠️ <b>Правила:</b>
+1. Будьте вежливы с другими пользователями
+2. Соблюдайте правила Telegram
+3. Запрещено нарушать законодательство
+
+❗️ <b>Нарушители правил блокируются!</b>
+"""
+    
+    safe_send_message(user_id, faq_text)
+
+@bot.message_handler(func=lambda m: m.text == "💎 Донат")
+def donate_command(message):
+    """Обработка команды доната"""
+    user_id = message.from_user.id
+    
+    donate_text = """
+💎 <b>Поддержите развитие бота через CryptoBot!</b>
+
+Ваша поддержка помогает:
+• Развивать новые функции
+• Улучшать стабильность работы
+• Добавлять новые возможности
+
+<b>Премиум-статус включает:</b>
+✅ Приоритетная поддержка
+
+💰 <b>299 сом/месяц</b> (примерно 3 USDT)
+"""
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("💳 PREMIUM", callback_data="buy_premium"),
+        types.InlineKeyboardButton("🎁 Поддержать", callback_data="simple_donate")
+    )
+    # УДАЛЕНО: кнопка "🔄 Проверить оплату"
+    
+    safe_send_message(user_id, donate_text, reply_markup=keyboard)
+
+# ===== ОБРАБОТКА ОТМЕНЫ =====
+@bot.message_handler(func=lambda m: m.text == "❌ Отмена")
+def cancel_command(message):
+    """Обработка кнопки отмены - сброс состояния и возврат в главное меню"""
+    user_id = message.from_user.id
+    
+    # Сбрасываем состояние пользователя
+    reset_user_state(user_id)
+    
+    # Отправляем сообщение с основной клавиатурой
+    safe_send_message(
+        user_id,
+        "❌ Действие отменено. Возвращаю в главное меню.",
+        reply_markup=get_main_keyboard()
+    )
+
+# ===== УМНАЯ ПОДДЕРЖКА =====
+def notify_admins_about_new_ticket(ticket):
+    """Уведомление администраторов о новом тикете"""
+    ticket_id = ticket['ticket_id']
+    user_id = ticket['user_id']
+    
+    admin_message = f"""
+🆕 <b>НОВЫЙ ТИКЕТ #{ticket_id}</b>
+
+👤 <b>Пользователь:</b> {ticket['first_name']} {ticket['last_name']}
+🔗 <b>Username:</b> @{ticket['username'] if ticket['username'] != 'нет' else 'не указан'}
+🏷️ <b>Категория:</b> {ticket['category']}
+🕐 <b>Дата:</b> {ticket['created_at'].strftime('%d.%m.%Y %H:%M')}
+
+📝 <b>Сообщение:</b>
+"{ticket['messages'][0]['text']}"
+"""
+    
+    # Отправляем уведомления администраторам
+    for admin_id in [ADMIN_CEO_ID, ADMIN_SUPPORT_ID]:
+        if admin_id:
+            try:
+                keyboard = get_admin_keyboard(ticket_id, user_id)
+                admin_msg = bot.send_message(
+                    admin_id,
+                    admin_message,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+                storage.admin_messages[(admin_id, admin_msg.message_id)] = (user_id, ticket_id)
+                logger.info(f"Уведомление о новом тикете {ticket_id} отправлено администратору {admin_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки уведомления администратору {admin_id}: {e}")
+
+def notify_admins_about_update(ticket, new_message):
+    """Уведомление администраторов о новом сообщении в существующем тикете"""
+    ticket_id = ticket['ticket_id']
+    user_id = ticket['user_id']
+    
+    update_message = f"""
+📨 <b>НОВОЕ СООБЩЕНИЕ В ТИКЕТЕ #{ticket_id}</b>
+
+👤 <b>Пользователь:</b> {ticket['first_name']} {ticket['last_name']}
+🔗 <b>Username:</b> @{ticket['username'] if ticket['username'] != 'нет' else 'не указан'}
+🏷️ <b>Категория:</b> {ticket['category']}
+📊 <b>Статус:</b> {ticket['status']}
+🕐 <b>Дата обновления:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}
+
+📝 <b>Новое сообщение:</b>
+"{new_message[:200]}{'...' if len(new_message) > 200 else ''}"
+
+📋 <b>Исходное сообщение:</b>
+"{ticket['messages'][0]['text'][:100]}..."
+"""
+    
+    # Отправляем уведомления администраторам
+    for admin_id in [ADMIN_CEO_ID, ADMIN_SUPPORT_ID]:
+        if admin_id:
+            try:
+                keyboard = get_admin_keyboard(ticket_id, user_id)
+                admin_msg = bot.send_message(
+                    admin_id,
+                    update_message,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+                storage.admin_messages[(admin_id, admin_msg.message_id)] = (user_id, ticket_id)
+                logger.info(f"Уведомление об обновлении тикета {ticket_id} отправлено администратору {admin_id}")
+            except Exception as e:
+                logger.error(f"Ошибка отправки уведомления администратору {admin_id}: {e}")
+
+def remove_admin_keyboard(admin_id, message_id):
+    """Удаляет inline-клавиатуру с сообщения администратора"""
+    try:
+        bot.edit_message_reply_markup(
+            chat_id=admin_id,
+            message_id=message_id,
+            reply_markup=None
+        )
+    except Exception as e:
+        logger.error(f"Ошибка удаления клавиатуры у админа {admin_id}: {e}")
+
+def update_admin_messages(ticket_id, status_text):
+    """Обновляет сообщения у всех администраторов о тикете"""
+    for (admin_id, msg_id), (user_id, tkt_id) in list(storage.admin_messages.items()):
+        if tkt_id == ticket_id:
+            try:
+                ticket = smart_support.get_ticket(ticket_id)
+                if ticket:
+                    first_name = ticket.get('first_name', 'Пользователь')
+                    username = ticket.get('username', 'нет')
+                    timestamp = ticket.get('updated_at', datetime.now()).strftime('%d.%m.%Y %H:%M')
+                    
+                    updated_text = f"""
+<b>Обращение в поддержку</b>
+
+🔸 <b>Тикет:</b> #{ticket_id}
+👤 <b>Пользователь:</b> {first_name}
+🔗 <b>Username:</b> @{username if username != 'нет' else 'не указан'}
+🕐 <b>Обновлено:</b> {timestamp}
+📊 <b>Статус:</b> {status_text}
+
+📝 <b>Последнее сообщение:</b>
+"{ticket['messages'][-1]['text'][:100]}..."
+"""
+                    
+                    # Обновляем сообщение без клавиатуры
+                    bot.edit_message_text(
+                        chat_id=admin_id,
+                        message_id=msg_id,
+                        text=updated_text,
+                        parse_mode="HTML",
+                        reply_markup=None
+                    )
+                
+                # Удаляем из отслеживания
+                del storage.admin_messages[(admin_id, msg_id)]
+                
+            except Exception as e:
+                logger.error(f"Ошибка обновления сообщения админа {admin_id}: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "📞 Поддержка")
+def smart_support_command(message):
+    """Обработка команды поддержки с интеллектуальными функциями"""
+    user_id = message.from_user.id
+    
+    # Получаем историю тикетов пользователя
+    user_tickets = smart_support.get_user_tickets(user_id)
+    open_tickets = [t for t in user_tickets if t['status'] in ['new', 'pending']]
+    
+    support_text = """📞 <b>Техническая поддержка</b>
+
+Опишите вашу проблему или вопрос:
+• Вопросы по оплате
+• Технические проблемы  
+• Предложения по улучшению
+• Общие вопросы
+
+<b>Наш менеджер ответит вам в течение 24 часов.</b>"""
+    
+    # Если у пользователя есть открытые тикеты
+    if open_tickets:
+        support_text += "\n\n⚠️ <b>У вас есть открытые обращения:</b>"
+        for ticket in open_tickets[:3]:  # Показываем до 3 открытых тикетов
+            status_emoji = "🆕" if ticket['status'] == 'new' else "⏳"
+            ticket_preview = ticket['messages'][0]['text'][:50] + "..." if len(ticket['messages'][0]['text']) > 50 else ticket['messages'][0]['text']
+            support_text += f"\n{status_emoji} Тикет #{ticket['ticket_id']}: {ticket_preview}"
+        
+        support_text += "\n\n<i>Пожалуйста, дождитесь ответа по текущим обращениям.</i>"
+    
+    UserState.set_state(user_id, "waiting_support")
+    safe_send_message(user_id, support_text, reply_markup=get_cancel_keyboard())
+
+@bot.message_handler(func=lambda m: UserState.get_state(m.from_user.id) == "waiting_support")
+def handle_smart_support_message(message):
+    """Обработка сообщения в поддержку с интеллектуальными функциями"""
+    user_id = message.from_user.id
+    message_text = message.text.strip()
+    
+    if not message_text or message_text == "❌ Отмена":
+        reset_user_state(user_id)
+        safe_send_message(user_id, "❌ Сообщение в поддержку отменено.")
+        return
+    
+    # Получаем данные пользователя
+    user_data = storage.users.get(user_id, {})
+    first_name = user_data.get('first_name', message.from_user.first_name)
+    last_name = user_data.get('last_name', message.from_user.last_name or '')
+    username = user_data.get('username', message.from_user.username or 'нет')
+    
+    # Создаем тикет через умную систему
+    ticket, duplicates = smart_support.create_ticket(
+        user_id, username, first_name, last_name, message_text
+    )
+    
+    # Если найдены дубликаты
+    if duplicates:
+        duplicate_ticket = duplicates[0]
+        
+        # Добавляем сообщение в существующий тикет
+        smart_support.add_message(
+            duplicate_ticket['ticket_id'],
+            'user',
+            f"📨 Дополнительное сообщение: {message_text}",
+            action="duplicate_message_added"
+        )
+        
+        # Уведомляем пользователя о дубликате
+        duplicate_message = f"""
+⚠️ <b>Похожее обращение уже существует</b>
+
+Мы нашли похожий вопрос, который вы уже задавали ранее.
+
+🔸 <b>Ваш текущий тикет:</b> #{duplicate_ticket['ticket_id']}
+🔸 <b>Статус:</b> {duplicate_ticket['status']}
+🔸 <b>Создан:</b> {duplicate_ticket['created_at'].strftime('%d.%m.%Y %H:%M')}
+
+📝 <b>Текст вашего предыдущего обращения:</b>
+"{duplicate_ticket['messages'][0]['text'][:100]}..."
+
+✅ <b>Мы добавили ваше новое сообщение к существующему тикету.</b>
+Пожалуйста, дождитесь ответа от поддержки.
+"""
+        
+        reset_user_state(user_id)
+        safe_send_message(user_id, duplicate_message)
+        
+        # Уведомляем администраторов о новом сообщении в существующем тикете
+        notify_admins_about_update(duplicate_ticket, message_text)
+        
+        return
+    
+    # Если это новый тикет, отправляем подтверждение
+    confirmation_message = f"""
+✅ <b>Ваше обращение зарегистрировано!</b>
+
+🔸 <b>Номер тикета:</b> #{ticket['ticket_id']}
+🔸 <b>Категория:</b> {ticket['category']}
+🔸 <b>Дата создания:</b> {ticket['created_at'].strftime('%d.%m.%Y %H:%M')}
+
+📋 <b>Ваше сообщение:</b>
+"{message_text}"
+
+<b>Статус:</b> 🆕 Ожидает рассмотрения
+<b>Ожидаемое время ответа:</b> до 24 часов
+
+💡 <i>Сохраните номер тикета для отслеживания статуса.</i>
+"""
+    
+    reset_user_state(user_id)
+    safe_send_message(user_id, confirmation_message)
+    
+    # Уведомляем администраторов о новом тикете
+    notify_admins_about_new_ticket(ticket)
+
+# ===== ОБРАБОТКА КНОПОК АДМИНИСТРАТОРА =====
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
+def admin_callback_handler(call):
+    """Обработка действий администратора с тикетами"""
+    admin_id = call.from_user.id
+    admin_username = call.from_user.username
+    
+    # Проверяем права администратора
+    if not is_admin(admin_id, admin_username):
+        bot.answer_callback_query(call.id, "❌ У вас нет прав для этого действия", show_alert=True)
+        return
+    
+    # Разбираем callback data
+    parts = call.data.split(':')
+    action = parts[0]
+    user_id = int(parts[1]) if len(parts) > 1 else None
+    ticket_id = parts[2] if len(parts) > 2 else None
+    
+    if not user_id or not ticket_id:
+        bot.answer_callback_query(call.id, "❌ Ошибка: данные не найдены", show_alert=True)
+        return
+    
+    # Получаем тикет
+    ticket = smart_support.get_ticket(ticket_id)
+    if not ticket:
+        bot.answer_callback_query(call.id, "❌ Тикет не найден или уже обработан", show_alert=True)
+        return
+    
+    # Обрабатываем действия
+    if action == "admin_reply":
+        # Устанавливаем состояние ответа для администратора
+        storage.admin_reply_context[admin_id] = {
+            'user_id': user_id,
+            'ticket_id': ticket_id,
+            'original_message_id': call.message.message_id,
+            'timestamp': datetime.now()
+        }
+        
+        # Удаляем клавиатуру с исходного сообщения
+        remove_admin_keyboard(admin_id, call.message.message_id)
+        
+        # Запрашиваем текст ответа
+        bot.send_message(
+            admin_id,
+            f"✏️ <b>Введите текст ответа для тикета #{ticket_id}:</b>\n\n"
+            f"Пользователь: {ticket['first_name']}\n"
+            f"Категория: {ticket['category']}\n\n"
+            "Ответ будет отправлен от имени поддержки.",
+            reply_markup=get_cancel_keyboard()
+        )
+        
+        bot.answer_callback_query(call.id, "✏️ Введите текст ответа")
+    
+    elif action == "admin_solved":
+        # Обновляем статус тикета
+        smart_support.update_status(ticket_id, 'solved', admin_id)
+        smart_support.add_message(
+            ticket_id,
+            'system',
+            f"Тикет помечен как решенный администратором {admin_id}",
+            action="marked_solved"
+        )
+        
+        # Отправляем пользователю сообщение о решении
+        try:
+            bot.send_message(
+                user_id,
+                f"✅ <b>Ваш тикет #{ticket_id} решён!</b>\n\n"
+                "Спасибо за обращение. Если у вас возникнут новые вопросы, "
+                "обращайтесь в поддержку.",
+                reply_markup=get_main_keyboard()
+            )
+            logger.info(f"Тикет {ticket_id} помечен как решенный администратором {admin_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        
+        # Обновляем сообщения у администраторов
+        update_admin_messages(ticket_id, "✅ Решено")
+        
+        bot.answer_callback_query(call.id, "✅ Тикет помечен как решенный")
+    
+    elif action == "admin_pending":
+        # Обновляем статус тикета
+        smart_support.update_status(ticket_id, 'pending', admin_id)
+        smart_support.add_message(
+            ticket_id,
+            'system',
+            f"Тикет помечен как 'в работе' администратором {admin_id}",
+            action="marked_pending"
+        )
+        
+        # Отправляем пользователю сообщение
+        try:
+            bot.send_message(
+                user_id,
+                f"⏳ <b>Ваш тикет #{ticket_id} взят в работу.</b>\n\n"
+                "Наши специалисты работают над вашим вопросом. "
+                "Пожалуйста, ожидайте ответа.",
+                reply_markup=get_main_keyboard()
+            )
+            logger.info(f"Тикет {ticket_id} помечен как 'в работе' администратором {admin_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения пользователю {user_id}: {e}")
+        
+        # Обновляем сообщения у администраторов
+        update_admin_messages(ticket_id, "⏳ В работе")
+        
+        bot.answer_callback_query(call.id, "⏳ Тикет помечен как 'в работе'")
+    
+    elif action == "admin_history":
+        # Показываем историю тикетов пользователя
+        user_tickets = smart_support.get_user_tickets(user_id, limit=5)
+        
+        if not user_tickets:
+            history_text = f"📊 <b>История тикетов пользователя</b>\n\nУ пользователя нет предыдущих обращений."
+        else:
+            history_text = f"📊 <b>История тикетов пользователя</b>\n\n"
+            for tkt in user_tickets:
+                status_emoji = {
+                    'new': '🆕',
+                    'pending': '⏳',
+                    'solved': '✅',
+                    'closed': '🔒'
+                }.get(tkt['status'], '❓')
+                
+                history_text += f"{status_emoji} <b>#{tkt['ticket_id']}</b> - {tkt['category']}\n"
+                history_text += f"   {tkt['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+                history_text += f"   {tkt['messages'][0]['text'][:50]}...\n\n"
+        
+        bot.send_message(admin_id, history_text, parse_mode="HTML")
+        bot.answer_callback_query(call.id, "📊 История загружена")
+
+# ===== ОБРАБОТКА ОТВЕТОВ АДМИНИСТРАТОРА =====
+@bot.message_handler(func=lambda m: m.from_user.id in storage.admin_reply_context)
+def handle_admin_reply(message):
+    """Обработка ответа администратора пользователю"""
+    admin_id = message.from_user.id
+    
+    # Проверяем отмену
+    if message.text == "❌ Отмена":
+        if admin_id in storage.admin_reply_context:
+            del storage.admin_reply_context[admin_id]
+        bot.send_message(admin_id, "❌ Ответ отменен.")
+        return
+    
+    # Получаем контекст ответа
+    context = storage.admin_reply_context.get(admin_id)
+    if not context:
+        bot.send_message(admin_id, "❌ Контекст ответа утерян.")
+        return
+    
+    user_id = context.get('user_id')
+    ticket_id = context.get('ticket_id')
+    
+    # Получаем тикет
+    ticket = smart_support.get_ticket(ticket_id)
+    if not ticket:
+        bot.send_message(admin_id, "❌ Тикет не найден или уже обработан.")
+        if admin_id in storage.admin_reply_context:
+            del storage.admin_reply_context[admin_id]
+        return
+    
+    # Добавляем сообщение в тикет
+    smart_support.add_message(
+        ticket_id,
+        'admin',
+        message.text,
+        action="admin_reply"
+    )
+    
+    # Обновляем статус
+    smart_support.update_status(ticket_id, 'answered', admin_id)
+    
+    # Отправляем ответ пользователю
+    try:
+        response_text = f"""
+💬 <b>Поддержка ответила на тикет #{ticket_id}</b>
+
+{message.text}
+
+---
+🔸 <i>Если у вас остались вопросы, вы можете ответить на это сообщение, "
+"и ваш ответ будет добавлен к тикету #{ticket_id}.</i>
+"""
+        
+        bot.send_message(user_id, response_text, reply_markup=get_main_keyboard())
+        logger.info(f"Ответ администратора {admin_id} отправлен пользователю {user_id} для тикета {ticket_id}")
+        
+        # Уведомляем администратора
+        bot.send_message(
+            admin_id,
+            f"✅ <b>Ответ успешно отправлен пользователю!</b>\n\n"
+            f"Тикет: #{ticket_id}\n"
+            f"Пользователь: {ticket['first_name']}\n"
+            f"Статус: Отвечено"
+        )
+        
+        # Обновляем сообщения у всех администраторов
+        update_admin_messages(ticket_id, "💬 Отвечено")
+    
+    except Exception as e:
+        logger.error(f"Ошибка отправки ответа пользователю {user_id}: {e}")
+        bot.send_message(admin_id, f"❌ Ошибка отправки ответа: {e}")
+    
+    # Очищаем контекст
+    if admin_id in storage.admin_reply_context:
+        del storage.admin_reply_context[admin_id]
+
+# ===== ДОПОЛНИТЕЛЬНЫЙ ФУНКЦИОНАЛ ДОНАТА =====
+def create_donate_invoice(user_id, amount):
+    """Создание инвойса для доната"""
+    invoice = CryptoBotAPI.create_invoice(
+        amount=amount,
+        currency="USDT",
+        description=f"Поддержка развития бота: {amount} USDT",
+        payload=str(user_id)
+    )
+    
+    if invoice:
+        # Отправляем пользователю ссылку для оплаты
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard.add(types.InlineKeyboardButton("💳 Оплатить", url=invoice["pay_url"]))
+        
+        safe_send_message(
+            user_id,
+            f"❤️ <b>Спасибо за поддержку!</b>\n\n"
+            f"Оплатите {invoice['amount']} {invoice['asset']} для поддержки развития бота.\n\n"
+            "✅ После оплаты вы получите уведомление.\n"
+            "⏰ Ссылка для оплата действительна 30 минут.",
+            reply_markup=keyboard
+        )
+        return True
+    else:
+        safe_send_message(
+            user_id,
+            "❌ <b>Ошибка создания счета для оплаты.</b>\n\n"
+            "Попробуйте позже или выберите другую сумму."
+        )
+        return False
+
+@bot.callback_query_handler(func=lambda call: call.data == "simple_donate")
+def simple_donate_handler(call):
+    """Обработка кнопки 'Просто поддержать' с выбором суммы - ИСПРАВЛЕНО РАСПОЛОЖЕНИЕ КНОПОК"""
+    user_id = call.from_user.id
+    
+    # Сбрасываем предыдущее состояние
+    reset_user_state(user_id)
+    
+    # Текст согласно примеру
+    text = ("❤️ <b>Поддержка развития бота</b>\n\n"
+            "Выберите сумму поддержки или укажите свою:\n\n"
+            "• Минимальная сумма: <b>1 USDT</b>\n"
+            "• Максимальная сумма: <b>10000 USDT</b>\n\n"
+            "Ваша поддержка помогает развивать новые функции и улучшать работу бота!")
+    
+    # Создаем клавиатуру согласно ТЗ: 2 ряда по 2 кнопки
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    # Первый ряд: 1 USDT и 2 USDT
+    markup.add(
+        types.InlineKeyboardButton("❤️ 1 USDT", callback_data="donate_amount:1"),
+        types.InlineKeyboardButton("❤️ 2 USDT", callback_data="donate_amount:2")
+    )
+    
+    # Второй ряд: 5 USDT и 10 USDT
+    markup.add(
+        types.InlineKeyboardButton("❤️ 5 USDT", callback_data="donate_amount:5"),
+        types.InlineKeyboardButton("❤️ 10 USDT", callback_data="donate_amount:10")
+    )
+    
+    # Кнопка "Указать сумму" (отдельный ряд)
+    markup.row(types.InlineKeyboardButton("💰 Указать сумму", callback_data="enter_donate_amount"))
+    
+    # Кнопка "Назад" (отдельный ряд) - ИЗМЕНЕНО на back_to_donate
+    markup.row(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_donate"))
+    
+    # Отправляем единое сообщение с текстом и клавиатурой
+    try:
+        # Редактируем существующее сообщение
+        bot.edit_message_text(
+            text=text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+    except Exception as e:
+        # Если не удалось редактировать, отправляем новое сообщение
+        logger.warning(f"Не удалось редактировать сообщение: {e}")
+        bot.send_message(
+            user_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=markup
+        )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "enter_donate_amount")
+def enter_donate_amount_handler(call):
+    """Обработка кнопки 'Указать сумму'"""
+    user_id = call.from_user.id
+    UserState.set_state(user_id, "entering_donate_amount")
+    
+    bot.send_message(
+        user_id,
+        "💰 <b>Введите сумму доната в USDT:</b>\n\n"
+        "Укажите число от 1 до 10000.\n"
+        "Например: <code>3.5</code> или <code>15</code>\n\n"
+        "💡 <i>Курс: примерно 1 USDT = 100 сом</i>",
+        reply_markup=get_cancel_keyboard()
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('donate_amount:'))
+def fixed_donate_amount_handler(call):
+    """Обработка выбора фиксированной суммы доната"""
+    user_id = call.from_user.id
+    amount_str = call.data.split(':')[1]
+    
+    try:
+        amount = float(amount_str)
+        if 1 <= amount <= 10000:
+            create_donate_invoice(user_id, amount)
+        else:
+            bot.answer_callback_query(call.id, 
+                "❌ Сумма должна быть от 1 до 10000 USDT", 
+                show_alert=True)
+    except ValueError:
+        bot.answer_callback_query(call.id, 
+            "❌ Некорректная сумма", 
+            show_alert=True)
+    
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "buy_premium")
+def buy_premium(call):
+    """Покупка PREMIUM статуса"""
+    user_id = call.from_user.id
+    
+    # Проверяем, не активирован ли уже PREMIUM
+    if user_id in storage.premium_users:
+        bot.answer_callback_query(call.id, 
+            "✅ У вас уже активирован PREMIUM статус!", 
+            show_alert=True)
+        return
+    
+    # Создаем инвойс
+    invoice = CryptoBotAPI.create_invoice(
+        amount=3,  # 3 USDT ≈ 299 сом
+        currency="USDT",
+        description="PREMIUM статус на 30 дней",
+        payload=str(user_id)
+    )
+    
+    if invoice:
+        # Отправляем пользователю ссылку для оплата
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton("💳 Оплатить", url=invoice["pay_url"]))
+        
+        bot.send_message(
+            user_id,
+            f"💎 <b>Оплатите {invoice['amount']} {invoice['asset']}</b>\n\n"
+            "Для активации PREMIUM статуса на 30 дней.\n\n"
+            "Ссылка для оплаты действительна 30 минут.\n"
+            "После оплаты статус активируется автоматически.",
+            reply_markup=keyboard
+        )
+        
+        bot.answer_callback_query(call.id, "✅ Счет создан")
+    else:
+        bot.answer_callback_query(call.id, 
+            "❌ Ошибка создания счета. Попробуйте позже.", 
+            show_alert=True)
+
+# ===== ОБРАБОТКА CALLBACK-КНОПОК =====
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
+def back_to_main_handler(call):
+    """Возврат в главное меню"""
+    user_id = call.from_user.id
+    reset_user_state(user_id)
+    bot.answer_callback_query(call.id, "✅ Возврат в главное меню")
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_donate")
+def back_to_donate_handler(call):
+    """Обработка кнопки 'Назад' в разделе поддержки - возврат в меню доната"""
+    user_id = call.from_user.id
+    
+    donate_text = """
+💎 <b>Поддержите развитие бота через CryptoBot!</b>
+
+Ваша поддержка помогает:
+• Развивать новые функции
+• Улучшать стабильность работы
+• Добавлять новые возможности
+
+<b>Премиум-статус включает:</b>
+✅ Приоритетная поддержка
+
+💰 <b>299 сом/месяц</b> (примерно 3 USDT)
+"""
+    
+    # Создаем клавиатуру с двумя кнопками (без кнопки проверки оплаты)
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("💳 PREMIUM", callback_data="buy_premium"),
+        types.InlineKeyboardButton("🎁 Поддержать", callback_data="simple_donate")
+    )
+    
+    try:
+        # Редактируем текущее сообщение
+        bot.edit_message_text(
+            text=donate_text,
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.error(f"Ошибка редактирования сообщения: {e}")
+        # В случае ошибки отправляем новое сообщение
+        bot.send_message(
+            user_id,
+            donate_text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+    
+    bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: UserState.get_state(m.from_user.id) == "entering_donate_amount")
+def handle_donate_amount_input(message):
+    """Обработка ввода суммы доната"""
+    user_id = message.from_user.id
+    amount_text = message.text.strip()
+    
+    # Проверяем отмену
+    if amount_text == "❌ Отмена":
+        reset_user_state(user_id)
+        return
+    
+    try:
+        # Пытаемся преобразовать в число с плавающей точкой
+        amount = float(amount_text.replace(',', '.').strip())
+        
+        if amount < 1:
+            safe_send_message(user_id,
+                "❌ <b>Сумма слишком мала!</b>\n\n"
+                "Минимальная сумма: <b>1 USDT</b>",
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+        
+        if amount > 10000:
+            safe_send_message(user_id,
+                "❌ <b>Сумма слишком велика!</b>\n\n"
+                "Максимальная сумма: <b>10000 USDT</b>",
+                reply_markup=get_cancel_keyboard()
+            )
+            return
+        
+        # Создаем инвойс
+        success = create_donate_invoice(user_id, amount)
+        if success:
+            reset_user_state(user_id)
+        
+    except ValueError:
+        safe_send_message(user_id,
+            "❌ <b>Некорректная сумма!</b>\n\n"
+            "Введите число от 1 до 10000.\n"
+            "Например: <code>3.5</code> или <code>15</code>",
+            reply_markup=get_cancel_keyboard()
+        )
+
+# ===== КОМАНДА ПРОВЕРКИ СТАТУСА ТИКЕТА =====
+@bot.message_handler(commands=['mytickets'])
+def my_tickets_command(message):
+    """Показывает пользователю его открытые тикеты"""
+    user_id = message.from_user.id
+    
+    user_tickets = smart_support.get_user_tickets(user_id)
+    open_tickets = [t for t in user_tickets if t['status'] in ['new', 'pending', 'answered']]
+    
+    if not open_tickets:
+        response = "📋 <b>Ваши обращения в поддержку</b>\n\nУ вас нет активных обращений."
+    else:
+        response = "📋 <b>Ваши активные обращения</b>\n\n"
+        for ticket in open_tickets:
+            status_text = {
+                'new': '🆕 Ожидает рассмотрения',
+                'pending': '⏳ В работе',
+                'answered': '💬 Получен ответ'
+            }.get(ticket['status'], '❓ Неизвестный статус')
+            
+            response += f"🔸 <b>Тикет #{ticket['ticket_id']}</b>\n"
+            response += f"   Статус: {status_text}\n"
+            response += f"   Создан: {ticket['created_at'].strftime('%d.%m.%Y %H:%M')}\n"
+            response += f"   Категория: {ticket['category']}\n\n"
+    
+    safe_send_message(user_id, response)
+
+# ===== ОЧИСТКА СТАРЫХ ДАННЫХ =====
+def cleanup_old_data():
+    """Очистка старых данных"""
+    logger.info("Запущена очистка старых данных")
+    
+    cutoff_time = datetime.now() - timedelta(hours=24)
+    cleaned_count = 0
+    
+    # Очищаем старые состояния
+    for user_id, state in list(storage.states.items()):
+        if state.get('timestamp', datetime.min) < cutoff_time:
+            del storage.states[user_id]
+            cleaned_count += 1
+    
+    # Очищаем старые сообщения поддержки (старше 30 дней)
+    support_cutoff = datetime.now() - timedelta(days=30)
+    for user_id, msg in list(storage.support_messages.items()):
+        if msg.get('timestamp', datetime.min) < support_cutoff:
+            del storage.support_messages[user_id]
+            cleaned_count += 1
+    
+    # Очищаем старый кэш сообщений
+    cache_cutoff = datetime.now() - timedelta(hours=6)
+    for key, msg_data in list(storage.message_cache.items()):
+        if msg_data.get('timestamp', datetime.min) < cache_cutoff:
+            del storage.message_cache[key]
+            cleaned_count += 1
+    
+    # Очищаем старые контексты ответов администраторов
+    admin_cutoff = datetime.now() - timedelta(hours=2)
+    for admin_id, context in list(storage.admin_reply_context.items()):
+        if context.get('timestamp', datetime.min) < admin_cutoff:
+            del storage.admin_reply_context[admin_id]
+            cleaned_count += 1
+    
+    logger.info(f"Очистка завершена. Удалено объектов: {cleaned_count}")
+    
+    # Запускаем следующую очистку через 1 час
+    threading.Timer(3600, cleanup_old_data).start()
+
+def cleanup_old_tickets():
+    """Очистка старых тикетов"""
+    logger.info("Запущена очистка старых тикетов")
+    
+    cutoff_time = datetime.now() - timedelta(days=30)
+    cleaned_count = 0
+    
+    for ticket_id, ticket in list(smart_support.tickets.items()):
+        if ticket.get('updated_at', datetime.min) < cutoff_time and ticket.get('status') in ['solved', 'closed']:
+            del smart_support.tickets[ticket_id]
+            cleaned_count += 1
+    
+    logger.info(f"Очистка тикетов завершена. Удалено: {cleaned_count}")
+    
+    # Запускаем следующую очистку через 6 часов
+    threading.Timer(21600, cleanup_old_tickets).start()
+
+# Запускаем очистку старых данных
+cleanup_old_data()
+cleanup_old_tickets()
+
+# ===== ЗАПУСК БОТА =====
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🤖 БОТ ДЛЯ ОБЪЯВЛЕНИЙ О ТЕЛЕФОНАХ")
+    print("=" * 60)
+    print(f"Telegram Bot Token: {'✅ Установлен' if TOKEN != '8397567369:AAFki44pWtxP5M9iPGEn26yvUsu1Fv-9g3o' else '❌ НЕ УСТАНОВЛЕН'}")
+    print(f"CryptoBot API Key: {'✅ Установлен' if CRYPTO_BOT_API_KEY != '498509:AABNPgPwTiCU9DdByIgswTvIuSz5VO9neRy' else '❌ НЕ УСТАНОВЛЕН'}")
+    print(f"Канал для публикаций: {CHANNEL_ID}")
+    print(f"Чат поддержки: {SUPPORT_CHAT_ID}")
+    print(f"CEO Admin ID: {ADMIN_CEO_ID or '❌ НЕ УСТАНОВЛЕН'}")
+    print(f"Support Admin ID: {ADMIN_SUPPORT_ID or '❌ НЕ УСТАНОВЛЕН'}")
+    print("=" * 60)
+    print("📢 Основные команды:")
+    print("• /start - Начать работу")
+    print("• /mytickets - Мои обращения в поддержку")
+    print("• 📞 Поддержка - Обратиться в поддержку")
+    print("=" * 60)
+    print("🔧 Фоновые процессы запущены:")
+    print("• Проверка платежей CryptoBot")
+    print("• Очистка старых данных")
+    print("• Очистка старых тикетов")
+    print("=" * 60)
+    print("✅ Функционал объявлений полностью удален!")
+    print("✅ Административный функционал полностью удален!")
+    print("✅ Сохранены: донат, поддержка, FAQ")
+    print("=" * 60)
+    print("🎯 Интеллектуальная система поддержки:")
+    print("• Автоматическая категоризация обращений")
+    print("• Предотвращение дубликатов")
+    print("• Подтверждение получения с номером тикета")
+    print("• Расширенное логирование всех действий")
+    print("• История тикетов пользователя")
+    print("• Команда /mytickets для отслеживания статуса")
+    print("=" * 60)
+    print("🚀 Запуск бота...")
+    print("Логи записываются в bot.log")
+    print("=" * 60)
+    
+    try:
+        bot.polling(
+            none_stop=True,
+            interval=0,
+            timeout=60,
+            long_polling_timeout=30
+        )
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Бот остановлен пользователем")
+        logger.info("Бот остановлен пользователем")
+        
+    except Exception as e:
+        logger.critical(f"Критическая ошибка бота: {e}")
+        print(f"❌ Критическая ошибка: {e}")
+        print("Попытка перезапуска через 30 секунд...")
